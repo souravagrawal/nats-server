@@ -9867,3 +9867,134 @@ func TestJetStreamConsumerNotInactiveDuringAckWaitBackoff(t *testing.T) {
 	t.Run("R1", func(t *testing.T) { test(t, 1) })
 	t.Run("R3", func(t *testing.T) { test(t, 3) })
 }
+
+// Test for EnforceOrderedDelivery configuration option
+func TestJetStreamConsumerEnforceOrderedDelivery(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	// Create a stream
+	mset, err := s.GlobalAccount().addStream(&StreamConfig{
+		Name:     "TEST",
+		Storage:  MemoryStorage,
+		Subjects: []string{"test.>"},
+	})
+	require_NoError(t, err)
+	defer mset.delete()
+
+	// Test 1: Default behavior (EnforceOrderedDelivery = false)
+	// Should allow new messages even with pending unacked messages
+	t.Run("DefaultBehavior", func(t *testing.T) {
+		// Create consumer with default behavior
+		consumer, err := mset.addConsumer(&ConsumerConfig{
+			Durable:                "test-default",
+			AckPolicy:              AckExplicit,
+			AckWait:                time.Second * 30, // Long ack wait to prevent automatic redelivery
+			MaxAckPending:          10,
+			EnforceOrderedDelivery: false, // Default behavior
+		})
+		require_NoError(t, err)
+		defer consumer.delete()
+
+		// Publish some messages
+		for i := 1; i <= 3; i++ {
+			_, _, err := mset.store.StoreMsg(fmt.Sprintf("test.%d", i), nil, []byte(fmt.Sprintf("msg %d", i)), 0)
+			require_NoError(t, err)
+		}
+
+		// Get first message (should work)
+		consumer.mu.Lock()
+		msg1, _, err := consumer.getNextMsg()
+		// Simulate delivery by adding to pending (like loopAndGatherMsgs does)
+		if err == nil && msg1 != nil {
+			consumer.trackPending(1, consumer.dseq)
+			consumer.dseq++
+		}
+		consumer.mu.Unlock()
+		require_NoError(t, err)
+		require_NotNil(t, msg1)
+		require_Equal(t, string(msg1.msg), "msg 1")
+
+		// Check that the first message is in pending
+		consumer.mu.Lock()
+		pendingCount := len(consumer.pending)
+		consumer.mu.Unlock()
+		require_Equal(t, pendingCount, 1)
+
+		// Get second message (should work even though first is pending - default behavior)
+		consumer.mu.Lock()
+		msg2, _, err := consumer.getNextMsg()
+		if err == nil && msg2 != nil {
+			consumer.trackPending(2, consumer.dseq)
+			consumer.dseq++
+		}
+		consumer.mu.Unlock()
+		require_NoError(t, err)
+		require_NotNil(t, msg2)
+		require_Equal(t, string(msg2.msg), "msg 2")
+
+		msg1.returnToPool()
+		msg2.returnToPool()
+	})
+
+	// Test 2: Strict ordering behavior (EnforceOrderedDelivery = true)
+	// Should not deliver new messages when there are pending unacked messages
+	t.Run("StrictOrdering", func(t *testing.T) {
+		// Create consumer with strict ordering
+		consumer, err := mset.addConsumer(&ConsumerConfig{
+			Durable:                "test-strict",
+			AckPolicy:              AckExplicit,
+			AckWait:                time.Second * 30, // Long ack wait to prevent automatic redelivery
+			MaxAckPending:          10,
+			EnforceOrderedDelivery: true, // Enable strict ordering
+		})
+		require_NoError(t, err)
+		defer consumer.delete()
+
+		// Reset stream sequence for clean test
+		consumer.mu.Lock()
+		consumer.sseq = 1
+		consumer.mu.Unlock()
+
+		// Get first message (should work)
+		consumer.mu.Lock()
+		msg1, _, err := consumer.getNextMsg()
+		// Simulate delivery by adding to pending (like loopAndGatherMsgs does)
+		if err == nil && msg1 != nil {
+			consumer.trackPending(1, consumer.dseq)
+			consumer.dseq++
+		}
+		consumer.mu.Unlock()
+		require_NoError(t, err)
+		require_NotNil(t, msg1)
+		require_Equal(t, string(msg1.msg), "msg 1")
+
+		// Check that the first message is in pending
+		consumer.mu.Lock()
+		pendingCount := len(consumer.pending)
+		consumer.mu.Unlock()
+		require_Equal(t, pendingCount, 1)
+
+		// Try to get second message (should fail due to strict ordering)
+		consumer.mu.Lock()
+		msg2, _, err := consumer.getNextMsg()
+		consumer.mu.Unlock()
+		require_Error(t, err)
+		require_Equal(t, err, errPendingRedeliveries)
+		require_Equal(t, msg2, (*jsPubMsg)(nil))
+
+		// ACK the first message
+		consumer.processAckMsg(1, 1, 1, "", false)
+
+		// Now getting the second message should work
+		consumer.mu.Lock()
+		msg2, _, err = consumer.getNextMsg()
+		consumer.mu.Unlock()
+		require_NoError(t, err)
+		require_NotNil(t, msg2)
+		require_Equal(t, string(msg2.msg), "msg 2")
+
+		msg1.returnToPool()
+		msg2.returnToPool()
+	})
+}

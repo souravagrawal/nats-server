@@ -128,6 +128,13 @@ type ConsumerConfig struct {
 	PriorityGroups []string       `json:"priority_groups,omitempty"`
 	PriorityPolicy PriorityPolicy `json:"priority_policy,omitempty"`
 	PinnedTTL      time.Duration  `json:"priority_timeout,omitempty"`
+
+	// EnforceOrderedDelivery enforces strict message ordering by preventing new message
+	// delivery when there are unacknowledged messages in o.pending.
+	// When true, new messages will not be delivered if there are pending unacked messages,
+	// ensuring messages are processed in strict order (either acked or redelivered first).
+	// When false (default), new messages can be delivered regardless of pending state.
+	EnforceOrderedDelivery bool `json:"enforce_ordered_delivery,omitempty"`
 }
 
 // SequenceInfo has both the consumer and the stream sequence and last activity.
@@ -4133,9 +4140,10 @@ func (o *consumer) isEqualOrSubsetMatch(subj string) bool {
 }
 
 var (
-	errMaxAckPending = errors.New("max ack pending reached")
-	errBadConsumer   = errors.New("consumer not valid")
-	errNoInterest    = errors.New("consumer requires interest for delivery subject when ephemeral")
+	errMaxAckPending       = errors.New("max ack pending reached")
+	errBadConsumer         = errors.New("consumer not valid")
+	errNoInterest          = errors.New("consumer requires interest for delivery subject when ephemeral")
+	errPendingRedeliveries = errors.New("pending messsages to be redelivered, wait for ackwait timeout")
 )
 
 // Get next available message from underlying store.
@@ -4187,6 +4195,13 @@ func (o *consumer) getNextMsg() (*jsPubMsg, uint64, error) {
 		// maxp only set when ack policy != AckNone and user set MaxAckPending
 		// Stall if we have hit max pending.
 		return nil, 0, errMaxAckPending
+	}
+
+	// If EnforceOrderedDelivery is enabled and there are pending unacked messages,
+	// do not deliver new messages. This ensures strict ordering where unacked messages
+	// must be handled (either acked or redelivered) before new messages can be delivered.
+	if o.cfg.EnforceOrderedDelivery && len(o.pending) > 0 {
+		return nil, 0, errPendingRedeliveries
 	}
 
 	if o.hasSkipListPending() {
@@ -4630,7 +4645,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 			if err == ErrStoreEOF {
 				o.checkNumPendingOnEOF()
 			}
-			if err == ErrStoreMsgNotFound || err == errDeletedMsg || err == ErrStoreEOF || err == errMaxAckPending {
+			if err == ErrStoreMsgNotFound || err == errDeletedMsg || err == ErrStoreEOF || err == errMaxAckPending || err == errPendingRedeliveries {
 				goto waitForMsgs
 			} else if err == errPartialCache {
 				s.Warnf("Unexpected partial cache error looking up message for consumer '%s > %s > %s'",
